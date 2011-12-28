@@ -16,59 +16,55 @@ if (!defined('PUN'))
 
 define('PUN_PARSER', '11-Feb-2011 13:33');
 
-require_once PUN_ROOT.'modules/cache/src/Cache/Cache.php';
+// !!!! AVOIDING PCRE STACK OVERFLOWS WHICH SEG-FAULT CRASH APACHE/PHP !!!!
+// By default, PHP sets up pcre.recursion_limit way too high (100000). According
+// to PCRE documentation, a sensible value for this parameter is the stacksize
+// of the PCRE executable, divided by 500. The Apache executable for Windows is
+// built with a 256KB stack, but most *nix installations set a stack size of 8MB.
+// We need to set the PCRE pcre.recursion_limit to the stacksize / 500. If this
+// precaution is not done, then an overly large subject text will cause the
+// executable to stack-overflow, and seg-fault crash with no warning. Taking the
+// following precaution, prevents this severe error and allows the program to
+// gracefully recover and display an appropriate error message.
+if (isset($_ENV['OS']) && $_ENV['OS'] === "Windows_NT")
+{ // Are we: Win NT, 2K, XP, Vista or 7)?
+	ini_set("pcre.recursion_limit", "524"); // 256KB / 500 = 524
+}
+else
+{ // Otherwise assume we are on a *nix box.
+	ini_set("pcre.recursion_limit", "16777"); // 8MB / 500 = 16777
+}
+
+if (!defined('PARSER_ROOT'))
+	define('PARSER_ROOT', dirname(__FILE__).'/');
+
 
 class Flux_Parser
 {
+	public static function compile()
+	{
+		require_once (PARSER_ROOT.'bbcd_source.php');
+		require_once (PARSER_ROOT.'bbcd_compile.php');
+		return $pd;
+	}
+
 	public $pd;
 
-	public function __construct()
+	public function __construct($pd = null)
 	{
-		global $cache;
-
-		if (!isset($cache))
-		{
-			global $flux_config;
-
-			$cache = Flux_Cache::load($flux_config['cache']['type'], array('dir' => $flux_config['cache']['dir']), 'VarExport'); // TODO: Move this config into config.php
-		}
-
-		$pd = $cache->get('parser_data');
-
-		// Cache needs to be re-generated.
-		if ($pd === Flux_Cache::NOT_FOUND)
-		{
-			require_once (PUN_ROOT.'include/bbcd_source.php');
-			require_once (PUN_ROOT.'include/bbcd_compile.php');
-			$cache->set('parser_data', $pd);
-		}
-
-		// !!!! AVOIDING PCRE STACK OVERFLOWS WHICH SEG-FAULT CRASH APACHE/PHP !!!!
-		// By default, PHP sets up pcre.recursion_limit way too high (100000). According
-		// to PCRE documentation, a sensible value for this parameter is the stacksize
-		// of the PCRE executable, divided by 500. The Apache executable for Windows is
-		// built with a 256KB stack, but most *nix installations set a stack size of 8MB.
-		// We need to set the PCRE pcre.recursion_limit to the stacksize / 500. If this
-		// precaution is not done, then an overly large subject text will cause the
-		// executable to stack-overflow, and seg-fault crash with no warning. Taking the
-		// following precaution, prevents this severe error and allows the program to
-		// gracefully recover and display an appropriate error message.
-		if (isset($_ENV['OS']) && $_ENV['OS'] === "Windows_NT")
-		{ // Are we: Win NT, 2K, XP, Vista or 7)?
-			ini_set("pcre.recursion_limit", "524"); // 256KB / 500 = 524
-		}
-		else
-		{ // Otherwise assume we are on a *nix box.
-			ini_set("pcre.recursion_limit", "16777"); // 8MB / 500 = 16777
-		}
+		if (!isset($pd))
+			$pd = Flux_Parser::compile();
 
 		$this->pd = $pd;
 	}
 
-
-	//
-	// Parse post or signature message text.
-	//
+	/**
+	 * Parse post or signature message text.
+	 *
+	 * @param string &$text
+	 * @param integer $hide_smilies
+	 * @return string
+	 */
 	public function parse_bbcode(&$text, $hide_smilies = 0)
 	{
 		global $pun_config, $pun_user;
@@ -120,16 +116,25 @@ class Flux_Parser
 		$text = str_replace('<p></p>', '', '<p>'.$text.'</p>');
 		return $text;
 	}
-	//
-	// Helper preg_replace_callback function for smilies processing.
-	//
+
+	/**
+	 * Helper preg_replace_callback function for smilies processing
+	 *
+	 * @param array $matches
+	 * @return string
+	 */
 	public function _do_smilies_callback($matches)
 	{
 		return $this->pd['smilies'][$matches[0]]['html'];
 	}
-	//
-	// Parse message text
-	//
+
+	/**
+	 * Parse message text
+	 *
+	 * @param string $text
+	 * @param integer $hide_smilies
+	 * @return string
+	 */
 	public function parse_message($text, $hide_smilies)
 	{
 		global $pun_config, $pun_user;
@@ -140,9 +145,13 @@ class Flux_Parser
 				$this->pd['bbcd']['img']['in_post'] = false;
 		return $this->parse_bbcode($text, $hide_smilies);
 	}
-	//
-	// Parse signature text
-	//
+
+	/**
+	 * Parse signature text
+	 *
+	 * @param string $text
+	 * @return string
+	 */
 	public function parse_signature($text)
 	{
 		global $pun_config, $pun_user;
@@ -154,25 +163,26 @@ class Flux_Parser
 		return $this->parse_bbcode($text);
 	}
 
-	/* ***********************************************************
-	callback function _preparse_bbcode_callback($matches)
-
-	This is the callback function for the main pre-parser. This routine is
-	called when the preg_replace_callback function within the preparse_bbcode()
-	function matches one BBCode open/close pair. The BBCode tag components are
-	passed in $matches. This routine checks for various error conditions and
-	repairs some of them. Erroneous code that cannot be fixed is wrapped in the
-	special error BBCode tag: ERR.
-
-	Parameters: (See the BBcode regex to see how each of these parameters are captured.)
-	$matches[0];					=  ([TAG=att]..content..[/TAG])	// The whole match.
-	$matches[1];	$tagname		=  (TAG)				// The BBCode tag name.
-	$matches[2];					=  (=)					// Attribute equals sign delimiter.
-	$matches[3];	$attribute		= '(attribute)'			// Attribute within single quotes, or
-	$matches[4];	$attribute		= "(attribute)"			// Attribute within double quotes or
-	$matches[5];	$attribute		=  (attribute)			// Attribute within no or any quotes.
-	$matches[6];	$contents		=  (tag contents)		// BBCode tag contents.
-	*********************************************************** */
+	/**
+	 * This is the callback function for the main pre-parser. This routine is
+	 * called when the preg_replace_callback function within the preparse_bbcode()
+	 * function matches one BBCode open/close pair. The BBCode tag components are
+	 * passed in $matches. This routine checks for various error conditions and
+	 * repairs some of them. Erroneous code that cannot be fixed is wrapped in the
+	 * special error BBCode tag: ERR.
+	 *
+	 * @param array $matches
+	 * 		Parameters: (See the BBcode regex to see how each of these parameters are captured.)
+	 * 		$matches[0];					=  ([TAG=att]..content..[/TAG])	// The whole match.
+	 * 		$matches[1];	$tagname		=  (TAG)				// The BBCode tag name.
+	 * 		$matches[2];					=  (=)					// Attribute equals sign delimiter.
+	 * 		$matches[3];	$attribute		= '(attribute)'			// Attribute within single quotes, or
+	 * 		$matches[4];	$attribute		= "(attribute)"			// Attribute within double quotes or
+	 * 		$matches[5];	$attribute		=  (attribute)			// Attribute within no or any quotes.
+	 * 		$matches[6];	$contents		=  (tag contents)		// BBCode tag contents.
+	 *
+	 * @return string
+	 */
 	public function _preparse_bbcode_callback($matches)
 	{
 		// TODO: $this->pd
@@ -716,12 +726,16 @@ class Flux_Parser
 		return $text;
 	}
 
-	/**----------------------------------------------------------------
-	* Pre-process text containing BBCodes. Check for integrity,
-	* well-formedness, nesting, etc. Flag errors by wrapping offending
-	* tags in a special [err] tag.
-	*-----------------------------------------------------------------
-	*/
+	/**
+	 * Pre-process text containing BBCodes. Check for integrity,
+	 * well-formedness, nesting, etc. Flag errors by wrapping offending
+	 * tags in a special [err] tag.
+	 *
+	 * @param string $text
+	 * @param array &$errors
+	 * @param integer $is_signature
+	 * @return string
+	 */
 	function preparse_bbcode($text, &$errors, $is_signature = false)
 	{
 		// TODO: $this->pd
@@ -778,9 +792,12 @@ class Flux_Parser
 		return $text;
 	}
 
-	//
-	// Helper preg_replace_callback function for orphan processing.
-	//
+	/**
+	 * Helper preg_replace_callback function for orphan processing.
+	 *
+	 * @param array $matches
+	 * @return string
+	 */
 	public function _orphan_callback($matches)
 	{
 		// TODO: $this->pd
@@ -798,9 +815,12 @@ class Flux_Parser
 		return '[err='.$errmsg.']'.$matches[0].'[/err]';
 	}
 
-	//
-	// Helper preg_replace_callback function for textile lists processing.
-	//
+	/**
+	 * Helper preg_replace_callback function for textile lists processing.
+	 *
+	 * @param array $matches
+	 * @return string
+	 */
 	public function _textile_list_callback($matches)
 	{
 		// TODO: $this->pd
@@ -816,9 +836,12 @@ class Flux_Parser
 		}
 	}
 
-	//
-	// Helper preg_replace_callback function for textile processing.
-	//
+	/**
+	 * Helper preg_replace_callback function for textile processing.
+	 *
+	 * @param array $matches
+	 * @return string
+	 */
 	public function _textile_phrase_callback($matches)
 	{
 		// TODO: $this->pd
@@ -849,10 +872,12 @@ class Flux_Parser
 		}
 	}
 
-	/* --- function preg_error()
-	Check to see what the last PREG/PCRE error was. Returns a string describing the
-	last error, or an empty string if there is no error.
-	--- */
+	/**
+	 * Check to see what the last PREG/PCRE error was. Returns a string describing the
+	 * last error, or an empty string if there is no error.
+	 *
+	 * @return string
+	 */
 	public function preg_error()
 	{
 		// TODO: $this->pd
@@ -883,30 +908,30 @@ class Flux_Parser
 		return $errmsg;
 	}
 
-	/* ***********************************************************
-	callback function _parse_bbcode_callback($matches)
-
-	This is the callback function for the main parser. This routine is called
-	when the preg_replace_callback function within the parse_bbcode() function
-	matches one BBCode open/close pair. The BBCode tag components are passed in
-	$matches. The BBCode is converted to HTML markup according to the format
-	string specified in the $bbcd array member for this tag. If an attribute is
-	specified, it is encoded along with the tag contents to generate a valid
-	HTML markup snippet. If this tag is not enabled (either the 'in_post' or
-	'in_sig' member in $bbcd are FALSE), then the output depends upon the tag
-	type; If 'zombie' or 'hidden', then both the tags and contents are displayed.
-	If 'normal', then the open and close tags are stripped and the contents are
-	displayed. If 'atomic', then both the tags and contents are stripped.
-
-	Parameters:
-	$matches[0];					=  ([TAG=att]..[/TAG])	// The whole match
-	$matches[1];	$tagname		=  (TAG)				// The BBCode tag name.
-	$matches[2];					=  (=)					// Attribute equals sign delimiter.
-	$matches[3];	$attribute		= '(attribute)'			// Attribute within single quotes.
-	$matches[4];	$attribute		= "(attribute)"			// Attribute within double quotes.
-	$matches[5];	$attribute		=  (attribute)			// Attribute within no-or-any quotes.
-	$matches[6];	$contents		=  (ontents)			// Tag contents.
-	*********************************************************** */
+	/**
+	 * This is the callback function for the main parser. This routine is called
+	 * when the preg_replace_callback function within the parse_bbcode() function
+	 * matches one BBCode open/close pair. The BBCode tag components are passed in
+	 * $matches. The BBCode is converted to HTML markup according to the format
+	 * string specified in the $bbcd array member for this tag. If an attribute is
+	 * specified, it is encoded along with the tag contents to generate a valid
+	 * HTML markup snippet. If this tag is not enabled (either the 'in_post' or
+	 * 'in_sig' member in $bbcd are FALSE), then the output depends upon the tag
+	 * type; If 'zombie' or 'hidden', then both the tags and contents are displayed.
+	 * If 'normal', then the open and close tags are stripped and the contents are
+	 * displayed. If 'atomic', then both the tags and contents are stripped.
+	 *
+	 * @param array $matches
+	 * 			$matches[0];					=  ([TAG=att]..[/TAG])	// The whole match
+	 * 			$matches[1];	$tagname		=  (TAG)				// The BBCode tag name.
+	 * 			$matches[2];					=  (=)					// Attribute equals sign delimiter.
+	 * 			$matches[3];	$attribute		= '(attribute)'			// Attribute within single quotes.
+	 * 			$matches[4];	$attribute		= "(attribute)"			// Attribute within double quotes.
+	 * 			$matches[5];	$attribute		=  (attribute)			// Attribute within no-or-any quotes.
+	 * 			$matches[6];	$contents		=  (ontents)			// Tag contents.
+	 *
+	 * @return string
+	 */
 	public function _parse_bbcode_callback($matches)
 	{
 		// TODO: $this->pd
